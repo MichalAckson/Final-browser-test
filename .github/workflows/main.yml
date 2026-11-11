@@ -1,0 +1,166 @@
+name: Blockert Browser Android CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blocker-android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build and verify Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      JAVA_VERSION: "21"
+      GRADLE_VERSION: "9.3.1"
+      ANDROID_API_LEVEL: "36"
+      ANDROID_BUILD_TOOLS: "36.0.0"
+      APP_ID: "com.chatgpt.blockertbrowser"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Locate Blockert project root
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f settings.gradle.kts && -f app/build.gradle.kts ]]; then
+            project_root="."
+          elif [[ -f BlockertBrowser/settings.gradle.kts && -f BlockertBrowser/app/build.gradle.kts ]]; then
+            project_root="BlockertBrowser"
+          else
+            echo "Could not find settings.gradle.kts and app/build.gradle.kts at the repository root or in ./BlockertBrowser." >&2
+            find . -maxdepth 3 \
+              \( -name settings.gradle.kts -o -name build.gradle.kts -o -name gradle-wrapper.properties \) \
+              -print >&2 || true
+            exit 1
+          fi
+          echo "path=${project_root}" >> "$GITHUB_OUTPUT"
+          echo "Project root: ${project_root}"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "${{ env.JAVA_VERSION }}"
+          check-latest: false
+
+      - name: Set up Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: "yes"
+
+      - name: Install the exact Android SDK packages used by this project
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "platform-tools"
+          sdkmanager --list_installed | grep -E \
+            "platforms;android-${ANDROID_API_LEVEL}|build-tools;${ANDROID_BUILD_TOOLS}|platform-tools"
+          echo "$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}" >> "$GITHUB_PATH"
+
+      - name: Set up the exact Gradle distribution and dependency cache
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "${{ env.GRADLE_VERSION }}"
+          cache-provider: basic
+          validate-wrappers: false
+          build-root-directory: "${{ steps.project.outputs.path }}"
+
+      - name: Verify toolchain and project identity
+        working-directory: ${{ steps.project.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version
+          gradle --version
+          grep -F 'applicationId = "com.chatgpt.blockertbrowser"' app/build.gradle.kts
+          grep -F 'namespace = "com.chatgpt.blockertbrowser"' app/build.gradle.kts
+          grep -F 'compileSdk = 36' app/build.gradle.kts
+          grep -F 'version "9.1.1"' build.gradle.kts
+
+      - name: Compile APK and run Android lint
+        working-directory: ${{ steps.project.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle \
+            --no-daemon \
+            --stacktrace \
+            --console=plain \
+            --warning-mode=all \
+            --max-workers=2 \
+            :app:clean \
+            :app:assembleDebug \
+            :app:lintDebug
+
+      - name: Verify APK package, signature and ARM64 payload
+        id: verify
+        working-directory: ${{ steps.project.outputs.path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$apk" || { echo "Debug APK was not generated: $apk" >&2; exit 1; }
+
+          badging="$(aapt dump badging "$apk")"
+          printf '%s\n' "$badging" | grep -F "package: name='${APP_ID}'"
+          printf '%s\n' "$badging" | grep -F "application-label:'Blockert Browser'"
+
+          apksigner verify --verbose --print-certs "$apk"
+          unzip -l "$apk" > "$RUNNER_TEMP/blockert-apk-contents.txt"
+          grep -m 5 -E 'lib/arm64-v8a/.*\.so$' "$RUNNER_TEMP/blockert-apk-contents.txt"
+          grep -qE 'classes([0-9]+)?\.dex$' "$RUNNER_TEMP/blockert-apk-contents.txt"
+
+          mkdir -p artifacts
+          cp "$apk" artifacts/BlockertBrowser-debug.apk
+          sha256sum artifacts/BlockertBrowser-debug.apk | tee artifacts/SHA256SUMS.txt
+          echo "apk=artifacts/BlockertBrowser-debug.apk" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Blockert Browser build succeeded"
+            echo "- Application ID: \`${APP_ID}\`"
+            echo "- Gradle: \`${GRADLE_VERSION}\`"
+            echo "- JDK: \`${JAVA_VERSION}\`"
+            echo "- Android compile SDK: \`${ANDROID_API_LEVEL}\`"
+            echo "- Build tools: \`${ANDROID_BUILD_TOOLS}\`"
+            echo "- APK: \`BlockertBrowser-debug.apk\`"
+            echo "- SHA-256:"
+            echo "  \`$(sha256sum artifacts/BlockertBrowser-debug.apk | cut -d ' ' -f 1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload installable debug APK
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.project.outputs.path }}/artifacts/BlockertBrowser-debug.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build diagnostics if the job fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: BlockertBrowser-build-diagnostics
+          path: |
+            ${{ steps.project.outputs.path }}/app/build/reports/**
+            ${{ steps.project.outputs.path }}/app/build/outputs/logs/**
+          if-no-files-found: ignore
+          retention-days: 14
